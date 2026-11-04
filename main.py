@@ -7,74 +7,78 @@ from knowledge.rag import RAGEngine
 from ingestion.pipeline import IngestionPipeline
 from agents.literature_reviewer import LiteratureReviewerAgent
 from agents.hypothesis_generator import HypothesisGeneratorAgent
+from agents.experiment_planner import ExperimentPlannerAgent
+from agents.code_executor import CodeExecutorAgent
+from execution.docker_executor import DockerExecutor
+from execution.sandbox import SandboxPolicy
+from storage.experiment_store import ExperimentStore
 from orchestration.workflow import DiscoveryWorkflow
 
 
-def build_system():
+def build():
     Config.ensure_dirs()
     vs = VectorStore()
     rag = RAGEngine(vs)
     pipeline = IngestionPipeline(vs)
+    store = ExperimentStore()
     reviewer = LiteratureReviewerAgent(rag)
-    hypothesizer = HypothesisGeneratorAgent()
-    return vs, pipeline, reviewer, hypothesizer, rag
-
-
-def cmd_ingest(topic: str):
-    vs, pipeline, *_ = build_system()
-    stats = pipeline.run(topic)
-    print(json.dumps(stats, indent=2))
-
-
-def cmd_query(question: str):
-    vs, _, _, _, rag = build_system()
-    if vs.count() == 0:
-        print("Knowledge base is empty. Run `ingest` first.")
-        sys.exit(1)
-    out = rag.answer(question)
-    print("=== ANSWER ===\n" + out["answer"])
-    print("\n=== SOURCES ===\n" + ", ".join(out["sources"]))
+    hypothesizer = HypothesisGeneratorAgent(rag)
+    planner = ExperimentPlannerAgent()
+    executor = CodeExecutorAgent(DockerExecutor(SandboxPolicy()), store)
+    return pipeline, reviewer, hypothesizer, planner, executor, store, vs, rag
 
 
 def cmd_discover(topic: str):
-    vs, pipeline, reviewer, hypothesizer, _ = build_system()
-    wf = DiscoveryWorkflow(pipeline, reviewer, hypothesizer)
-    state = wf.run(topic)
-    if state.get("error"):
-        print("ERROR:", state["error"])
-        sys.exit(1)
-    print("=== INGESTION ===")
-    print(json.dumps(state["ingestion_stats"], indent=2))
-    print("\n=== LITERATURE REVIEW ===")
-    print(state["review"])
-    print("\n=== SOURCES ===")
-    print(", ".join(state.get("sources", [])))
-    print("\n=== HYPOTHESES ===")
-    print(state["hypotheses"])
+    pipeline, reviewer, hyp, planner, executor, store, _, _ = build()
+    wf = DiscoveryWorkflow(pipeline, reviewer, hyp, planner, executor, store)
+    s = wf.run(topic)
+    print("=== INGESTION ==="); print(json.dumps(s.get("ingestion_stats", {}), indent=2))
+    print("\n=== REVIEW (head) ==="); print((s.get("review") or "")[:1500])
+    print("\n=== HYPOTHESIS ==="); print((s.get("chosen_hypothesis") or "")[:1200])
+    print("\n=== PLAN ==="); print(json.dumps(s.get("plan", {}), indent=2))
+    print("\n=== EXECUTION ==="); print(json.dumps({
+        "ok": s.get("code_result", {}).get("ok"),
+        "attempts": s.get("code_result", {}).get("attempts"),
+        "metrics": s.get("code_result", {}).get("metrics"),
+        "run_id": s.get("code_result", {}).get("run_id"),
+    }, indent=2))
+    print("\n=== RL ==="); print(json.dumps({
+        "state": s.get("rl_state"), "action": s.get("rl_action"),
+        "reward": s.get("rl_reward"),
+    }, indent=2))
+    if s.get("error"):
+        print("\nERROR:", s["error"])
+
+
+def cmd_rerun(experiment_id: str):
+    """Reuse a stored plan and re-execute (useful for debugging)."""
+    import sqlite3
+    _, _, _, planner, executor, store, _, _ = build()
+    row = store.conn.execute(
+        "SELECT plan_json FROM experiments WHERE id=?", (experiment_id,)
+    ).fetchone()
+    if not row:
+        print("experiment not found"); sys.exit(1)
+    plan = json.loads(row[0])
+    result = executor.run(experiment_id=experiment_id, plan=plan)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_history(experiment_id: str):
+    _, _, _, _, _, store, _, _ = build()
+    print(json.dumps(store.history(experiment_id), indent=2))
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Autonomous Multimodal Scientific Discovery Agent (Week 1)"
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p1 = sub.add_parser("ingest", help="Fetch papers and populate the vector DB")
-    p1.add_argument("--topic", required=True)
-
-    p2 = sub.add_parser("query", help="RAG query over the knowledge base")
-    p2.add_argument("--question", required=True)
-
-    p3 = sub.add_parser("discover", help="Full pipeline: ingest → review → hypothesize")
-    p3.add_argument("--topic", required=True)
-
-    args = parser.parse_args()
-    if args.cmd == "ingest":
-        cmd_ingest(args.topic)
-    elif args.cmd == "query":
-        cmd_query(args.question)
-    elif args.cmd == "discover":
-        cmd_discover(args.topic)
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("discover"); d.add_argument("--topic", required=True)
+    r = sub.add_parser("rerun");    r.add_argument("--experiment-id", required=True)
+    h = sub.add_parser("history");  h.add_argument("--experiment-id", required=True)
+    args = p.parse_args()
+    if args.cmd == "discover": cmd_discover(args.topic)
+    elif args.cmd == "rerun":  cmd_rerun(args.experiment_id)
+    elif args.cmd == "history": cmd_history(args.experiment_id)
 
 
 if __name__ == "__main__":
