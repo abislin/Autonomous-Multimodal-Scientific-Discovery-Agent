@@ -1,13 +1,24 @@
+import json
 import uuid
+from pathlib import Path
 from typing import Dict, Any, TypedDict
+
 from langgraph.graph import StateGraph, END
+
+from config import Config
 from ingestion.pipeline import IngestionPipeline
 from agents.literature_reviewer import LiteratureReviewerAgent
 from agents.hypothesis_generator import HypothesisGeneratorAgent
 from agents.experiment_planner import ExperimentPlannerAgent
 from agents.code_executor import CodeExecutorAgent
+from agents.critic_agent import CriticAgent
 from storage.experiment_store import ExperimentStore
 from rl.interface import RLState, RLAction, transition
+from multimodal.figure_extractor import FigureExtractor
+from multimodal.chart_classifier import ChartClassifier
+from multimodal.vlm_client import VLMClient
+from statistics.validation import StatisticalValidator
+from memory.research_memory import ResearchMemory
 
 
 class ResearchState(TypedDict, total=False):
@@ -23,6 +34,10 @@ class ResearchState(TypedDict, total=False):
     rl_state: Dict[str, Any]
     rl_action: Dict[str, Any]
     rl_reward: float
+    figures: list
+    critique: Dict[str, Any]
+    stats_report: Dict[str, Any]
+    memory_id: str
     error: str
 
 
@@ -36,17 +51,26 @@ def _first_hypothesis_block(text: str) -> str:
 
 
 class DiscoveryWorkflow:
-    def __init__(self, pipeline: IngestionPipeline,
+    def __init__(self,
+                 pipeline: IngestionPipeline,
                  reviewer: LiteratureReviewerAgent,
                  hypothesizer: HypothesisGeneratorAgent,
                  planner: ExperimentPlannerAgent,
                  executor: CodeExecutorAgent,
-                 store: ExperimentStore):
-        self.pipeline, self.reviewer = pipeline, reviewer
-        self.hypothesizer, self.planner = hypothesizer, planner
-        self.executor, self.store = executor, store
+                 store: ExperimentStore,
+                 critic: CriticAgent = None,
+                 memory: ResearchMemory = None):
+        self.pipeline = pipeline
+        self.reviewer = reviewer
+        self.hypothesizer = hypothesizer
+        self.planner = planner
+        self.executor = executor
+        self.store = store
+        self.critic = critic or CriticAgent()
+        self.memory = memory or ResearchMemory()
         self.graph = self._build()
 
+    # ---------------- Week 1/2 nodes ----------------
     def _ingest(self, s: ResearchState) -> ResearchState:
         try:
             s["ingestion_stats"] = self.pipeline.run(s["topic"])
@@ -55,15 +79,18 @@ class DiscoveryWorkflow:
         return s
 
     def _review(self, s: ResearchState) -> ResearchState:
-        if s.get("error"): return s
+        if s.get("error"):
+            return s
         out = self.reviewer.run(s["topic"])
-        s["review"], s["sources"] = out["review"], out["sources"]
+        s["review"] = out["review"]
+        s["sources"] = out["sources"]
         return s
 
     def _hypothesize(self, s: ResearchState) -> ResearchState:
-        if s.get("error"): return s
+        if s.get("error"):
+            return s
         out = self.hypothesizer.run(s["topic"])
-        if out["hypotheses"].startswith("INSUFFICIENT_EVIDENCE"):
+        if (out.get("hypotheses") or "").startswith("INSUFFICIENT_EVIDENCE"):
             s["error"] = "hypotheses: insufficient evidence"
             return s
         s["hypotheses"] = out["hypotheses"]
@@ -72,7 +99,8 @@ class DiscoveryWorkflow:
         return s
 
     def _plan(self, s: ResearchState) -> ResearchState:
-        if s.get("error"): return s
+        if s.get("error"):
+            return s
         plan = self.planner.run(s["chosen_hypothesis"])
         if plan.get("_parse_error"):
             s["error"] = "plan: JSON parse failed"
@@ -83,35 +111,151 @@ class DiscoveryWorkflow:
             s["experiment_id"], s["topic"], s["chosen_hypothesis"], plan
         )
         # RL observation snapshot (a real policy would pick the action here)
-        s["rl_state"] = RLState(
+        rl_state = RLState(
             evidence_count=len(s.get("sources", [])),
             plan_task_type=plan.get("task_type", "classification"),
-        ).__dict__
-        s["rl_action"] = RLAction().asdict() if hasattr(RLAction(), "asdict") \
-                          else RLAction().__dict__
+        )
+        s["rl_state"] = rl_state.__dict__
+        s["rl_action"] = RLAction().__dict__
         return s
 
     def _execute(self, s: ResearchState) -> ResearchState:
-        if s.get("error"): return s
+        if s.get("error"):
+            return s
         result = self.executor.run(
             experiment_id=s["experiment_id"], plan=s["plan"]
         )
         s["code_result"] = result
-        if not result["ok"]:
+        if not result.get("ok"):
             s["error"] = f"execute: {result.get('error')}"
             return s
-        reward = transition(
-            state=RLState(**{k: v for k, v in s["rl_state"].items()
-                             if k in RLState.__dataclass_fields__}),
-            action=RLAction(),
-            result=result,
-            attempts=result["attempts"],
-            duration_s=s["code_result"].get("duration_s", 0.0),
-            budget_s=float(s["plan"].get("max_runtime_s", 180)),
-        )
-        s["rl_reward"] = reward.value()
+        try:
+            rl_state = RLState(**{
+                k: v for k, v in s["rl_state"].items()
+                if k in RLState.__dataclass_fields__
+            })
+            reward = transition(
+                state=rl_state,
+                action=RLAction(),
+                result=result,
+                attempts=result.get("attempts", 1),
+                duration_s=result.get("duration_s", 0.0),
+                budget_s=float(s["plan"].get("max_runtime_s", 180)),
+            )
+            s["rl_reward"] = reward.value()
+        except Exception:
+            s["rl_reward"] = 0.0
         return s
 
+    # ---------------- Week 3 nodes ----------------
+    def _analyse_figures(self, s: ResearchState) -> ResearchState:
+        """Extract figures from the paper PDFs and VLM-analyse them."""
+        if s.get("error"):
+            return s
+        try:
+            figs = []
+            extractor = FigureExtractor()
+            classifier = ChartClassifier()
+            vlm = VLMClient()
+            for pdf in Path(Config.PDF_DIR).glob("*.pdf"):
+                raw = extractor.extract(pdf, paper_id=pdf.stem)
+                for f in raw:
+                    hint = classifier.classify(f["image_path"])
+                    vlm_out = vlm.describe(
+                        f["image_path"], f.get("caption") or ""
+                    )
+                    vlm_out.setdefault("chart_type", hint["chart_type"])
+                    vlm_out["heuristic_chart_type"] = hint["chart_type"]
+                    self.store.save_figure(
+                        s["experiment_id"], f, vlm_out
+                    )
+                    f["vlm"] = vlm_out
+                    figs.append(f)
+            s["figures"] = figs
+        except Exception as e:
+            s["error"] = f"figures: {e}"
+        return s
+
+    def _validate_stats(self, s: ResearchState) -> ResearchState:
+        if s.get("error"):
+            return s
+        try:
+            history = self.store.history(s["experiment_id"])
+            ok_runs = [h for h in history if h.get("ok")]
+            scores = [
+                h["metrics"].get(
+                    "accuracy",
+                    h["metrics"].get("f1", h["metrics"].get("r2", 0.0)),
+                )
+                for h in ok_runs
+            ]
+            if len(scores) < 2:
+                s["stats_report"] = {
+                    "comparison": {
+                        "test": "none",
+                        "p_value": 1.0,
+                        "significant": False,
+                    },
+                    "interpretation":
+                        "Need >=2 successful runs for any comparison.",
+                }
+            else:
+                mid = len(scores) // 2
+                baseline = scores[:mid] or scores[:1]
+                proposed = scores[mid:] or scores[-1:]
+                validator = StatisticalValidator()
+                s["stats_report"] = validator.report(
+                    baseline, proposed, design_hint=None
+                )
+            self.store.save_stats(
+                s["experiment_id"], s["stats_report"]
+            )
+        except Exception as e:
+            s["error"] = f"stats: {e}"
+        return s
+
+    def _critique(self, s: ResearchState) -> ResearchState:
+        # critique may run even if execute failed, but skip on earlier errors
+        err = s.get("error") or ""
+        if err and "execute" not in err:
+            return s
+        try:
+            history = self.store.history(s["experiment_id"])
+            report = self.critic.run(
+                hypothesis=s.get("chosen_hypothesis", ""),
+                plan=s.get("plan", {}),
+                history=history,
+                stats=s.get("stats_report", {}),
+            )
+            s["critique"] = report
+            self.store.save_critique(s["experiment_id"], report)
+        except Exception as e:
+            s["error"] = f"critique: {e}"
+        return s
+
+    def _remember(self, s: ResearchState) -> ResearchState:
+        try:
+            existing = self.memory.has_similar_experiment(s["topic"])
+            if existing:
+                s["memory_id"] = existing["id"]
+                return s
+            blob = json.dumps({
+                "topic": s["topic"],
+                "hypothesis": (s.get("chosen_hypothesis") or "")[:800],
+                "metrics": (s.get("code_result") or {}).get("metrics", {}),
+                "verdict": (s.get("critique") or {}).get("verdict"),
+                "p_value": (s.get("stats_report") or {})
+                    .get("comparison", {}).get("p_value"),
+            })
+            s["memory_id"] = self.memory.remember(
+                kind="result", topic=s["topic"], text=blob,
+                metadata={"experiment_id": s["experiment_id"]},
+            )
+        except Exception as e:
+            s["error"] = f"memory: {e}"
+        return s
+
+    # ---------------- graph ----------------
     def _build(self):
         g = StateGraph(ResearchState)
         g.add_node("ingest", self._ingest)
@@ -119,12 +263,21 @@ class DiscoveryWorkflow:
         g.add_node("hypothesize", self._hypothesize)
         g.add_node("plan", self._plan)
         g.add_node("execute", self._execute)
+        g.add_node("figures", self._analyse_figures)
+        g.add_node("stats", self._validate_stats)
+        g.add_node("critique", self._critique)
+        g.add_node("remember", self._remember)
+
         g.set_entry_point("ingest")
         g.add_edge("ingest", "review")
         g.add_edge("review", "hypothesize")
         g.add_edge("hypothesize", "plan")
         g.add_edge("plan", "execute")
-        g.add_edge("execute", END)
+        g.add_edge("execute", "figures")
+        g.add_edge("figures", "stats")
+        g.add_edge("stats", "critique")
+        g.add_edge("critique", "remember")
+        g.add_edge("remember", END)
         return g.compile()
 
     def run(self, topic: str) -> ResearchState:
