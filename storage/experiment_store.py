@@ -2,7 +2,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 
 DB_PATH = Path("artifacts/experiments.sqlite3")
@@ -62,6 +62,31 @@ CREATE TABLE IF NOT EXISTS stats_reports (
 );
 """
 
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS papers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT,
+    topic TEXT,
+    latex_path TEXT,
+    pdf_path TEXT,
+    abstract TEXT,
+    status TEXT,
+    created_at REAL
+);
+CREATE TABLE IF NOT EXISTS synthesis_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT,
+    payload_json TEXT,
+    created_at REAL
+);
+CREATE TABLE IF NOT EXISTS evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    payload_json TEXT,
+    created_at REAL
+);
+"""
+
 
 class ExperimentStore:
     def __init__(self, path: Path = DB_PATH):
@@ -69,6 +94,7 @@ class ExperimentStore:
         self.conn = sqlite3.connect(str(path))
         self.conn.executescript(SCHEMA)
         self.conn.executescript(SCHEMA_V3)
+        self.conn.executescript(SCHEMA_V4)
         self.conn.commit()
 
     # ---------- experiments ----------
@@ -119,7 +145,7 @@ class ExperimentStore:
             for r in cur.fetchall()
         ]
 
-    # ---------- figures (Week 3) ----------
+    # ---------- figures ----------
     def save_figure(self, experiment_id: str, fig: Dict[str, Any],
                     vlm_result: Dict[str, Any]) -> None:
         self.conn.execute(
@@ -132,7 +158,7 @@ class ExperimentStore:
         )
         self.conn.commit()
 
-    # ---------- critiques (Week 3) ----------
+    # ---------- critiques ----------
     def save_critique(self, experiment_id: str,
                       report: Dict[str, Any]) -> None:
         self.conn.execute(
@@ -145,7 +171,7 @@ class ExperimentStore:
         )
         self.conn.commit()
 
-    # ---------- statistics (Week 3) ----------
+    # ---------- statistics ----------
     def save_stats(self, experiment_id: str,
                    report: Dict[str, Any]) -> None:
         comp = report.get("comparison", {}) or {}
@@ -156,5 +182,67 @@ class ExperimentStore:
              float(comp.get("p_value", 1.0) or 1.0),
              int(bool(comp.get("significant", False))),
              time.time()),
+        )
+        self.conn.commit()
+
+    # ---------- papers ----------
+    def save_paper(self, experiment_id: str, topic: str,
+                   latex_path: str, pdf_path: str, abstract: str,
+                   status: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO papers (experiment_id, topic, latex_path, pdf_path, "
+            "abstract, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            (experiment_id, topic, latex_path, pdf_path, abstract,
+             status, time.time()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def latest_paper(self, experiment_id: Optional[str] = None):
+        if experiment_id:
+            cur = self.conn.execute(
+                "SELECT * FROM papers WHERE experiment_id=? "
+                "ORDER BY id DESC LIMIT 1", (experiment_id,),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT * FROM papers ORDER BY id DESC LIMIT 1"
+            )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+    # ---------- synthesis ----------
+    def save_synthesis(self, experiment_id: str,
+                       payload: Dict[str, Any]) -> None:
+        self.conn.execute(
+            "INSERT INTO synthesis_runs (experiment_id, payload_json, "
+            "created_at) VALUES (?,?,?)",
+            (experiment_id, json.dumps(payload, default=str), time.time()),
+        )
+        self.conn.commit()
+
+    def latest_synthesis(self, experiment_id: Optional[str] = None):
+        if experiment_id:
+            cur = self.conn.execute(
+                "SELECT payload_json FROM synthesis_runs "
+                "WHERE experiment_id=? ORDER BY id DESC LIMIT 1",
+                (experiment_id,),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT payload_json FROM synthesis_runs ORDER BY id DESC LIMIT 1"
+            )
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+
+    # ---------- evaluations ----------
+    def save_evaluation(self, run_id: str, payload: Dict[str, Any]) -> None:
+        self.conn.execute(
+            "INSERT INTO evaluations (run_id, payload_json, created_at) "
+            "VALUES (?,?,?)",
+            (run_id, json.dumps(payload, default=str), time.time()),
         )
         self.conn.commit()
