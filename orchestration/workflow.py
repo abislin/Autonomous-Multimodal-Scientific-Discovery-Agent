@@ -19,6 +19,9 @@ from multimodal.chart_classifier import ChartClassifier
 from multimodal.vlm_client import VLMClient
 from statistics.validation import StatisticalValidator
 from memory.research_memory import ResearchMemory
+from synthesis.synthesis_agent import ResearchSynthesisAgent
+from synthesis.latex_generator import LaTeXGenerator
+from synthesis.latex_compiler import LaTeXCompiler
 
 
 class ResearchState(TypedDict, total=False):
@@ -38,11 +41,16 @@ class ResearchState(TypedDict, total=False):
     critique: Dict[str, Any]
     stats_report: Dict[str, Any]
     memory_id: str
+    _history: list
+    _rag_hits: list
+    synthesis: Dict[str, Any]
+    paper: Dict[str, Any]
+    tex_path: str
+    pdf_path: str
     error: str
 
 
 def _first_hypothesis_block(text: str) -> str:
-    """Extract the first HYPOTHESIS: ... block for planning."""
     marker = "HYPOTHESIS:"
     if marker in text:
         start = text.index(marker)
@@ -59,7 +67,8 @@ class DiscoveryWorkflow:
                  executor: CodeExecutorAgent,
                  store: ExperimentStore,
                  critic: CriticAgent = None,
-                 memory: ResearchMemory = None):
+                 memory: ResearchMemory = None,
+                 synthesis: ResearchSynthesisAgent = None):
         self.pipeline = pipeline
         self.reviewer = reviewer
         self.hypothesizer = hypothesizer
@@ -68,6 +77,7 @@ class DiscoveryWorkflow:
         self.store = store
         self.critic = critic or CriticAgent()
         self.memory = memory or ResearchMemory()
+        self.synthesis = synthesis or ResearchSynthesisAgent()
         self.graph = self._build()
 
     # ---------------- Week 1/2 nodes ----------------
@@ -84,6 +94,10 @@ class DiscoveryWorkflow:
         out = self.reviewer.run(s["topic"])
         s["review"] = out["review"]
         s["sources"] = out["sources"]
+        try:
+            s["_rag_hits"] = self.reviewer.rag.retrieve(s["topic"], top_k=10)
+        except Exception:
+            s["_rag_hits"] = []
         return s
 
     def _hypothesize(self, s: ResearchState) -> ResearchState:
@@ -110,7 +124,6 @@ class DiscoveryWorkflow:
         self.store.create_experiment(
             s["experiment_id"], s["topic"], s["chosen_hypothesis"], plan
         )
-        # RL observation snapshot (a real policy would pick the action here)
         rl_state = RLState(
             evidence_count=len(s.get("sources", [])),
             plan_task_type=plan.get("task_type", "classification"),
@@ -149,7 +162,6 @@ class DiscoveryWorkflow:
 
     # ---------------- Week 3 nodes ----------------
     def _analyse_figures(self, s: ResearchState) -> ResearchState:
-        """Extract figures from the paper PDFs and VLM-analyse them."""
         if s.get("error"):
             return s
         try:
@@ -215,7 +227,6 @@ class DiscoveryWorkflow:
         return s
 
     def _critique(self, s: ResearchState) -> ResearchState:
-        # critique may run even if execute failed, but skip on earlier errors
         err = s.get("error") or ""
         if err and "execute" not in err:
             return s
@@ -255,6 +266,72 @@ class DiscoveryWorkflow:
             s["error"] = f"memory: {e}"
         return s
 
+    # ---------------- Week 4 nodes ----------------
+    def _collect_context(self, s: ResearchState) -> ResearchState:
+        if s.get("error"):
+            return s
+        try:
+            s["_history"] = self.store.history(s.get("experiment_id", ""))
+            if "_rag_hits" not in s or not s["_rag_hits"]:
+                try:
+                    s["_rag_hits"] = self.reviewer.rag.retrieve(
+                        s["topic"], top_k=10
+                    )
+                except Exception:
+                    s["_rag_hits"] = []
+        except Exception as e:
+            s["error"] = f"collect: {e}"
+        return s
+
+    def _synthesize(self, s: ResearchState) -> ResearchState:
+        if s.get("error"):
+            return s
+        try:
+            out = self.synthesis.run(s)
+            s["synthesis"] = out
+            self.store.save_synthesis(s.get("experiment_id", ""), out)
+        except Exception as e:
+            s["error"] = f"synthesis: {e}"
+        return s
+
+    def _generate_latex(self, s: ResearchState) -> ResearchState:
+        if s.get("error"):
+            return s
+        try:
+            gen = LaTeXGenerator()
+            built = gen.build(
+                experiment_id=s.get("experiment_id", "exp"),
+                state=s,
+                synthesis=s.get("synthesis", {}),
+            )
+            s["tex_path"] = built["tex_path"]
+            s["paper"] = {
+                "tex_path": built["tex_path"],
+                "bib_path": built["bib_path"],
+                "title": built["title"],
+                "abstract": built["abstract"],
+            }
+            compiler = LaTeXCompiler()
+            compiled = compiler.compile(built["tex_path"])
+            s["paper"]["pdf_path"] = compiled.get("pdf_path")
+            s["paper"]["compile"] = {
+                "ok": compiled.get("ok"),
+                "errors": compiled.get("errors", []),
+                "warnings": compiled.get("warnings", []),
+            }
+            s["pdf_path"] = compiled.get("pdf_path")
+            self.store.save_paper(
+                experiment_id=s.get("experiment_id", "exp"),
+                topic=s.get("topic", ""),
+                latex_path=built["tex_path"],
+                pdf_path=compiled.get("pdf_path") or "",
+                abstract=built["abstract"] or "",
+                status="compiled" if compiled.get("ok") else "generated",
+            )
+        except Exception as e:
+            s["error"] = f"latex: {e}"
+        return s
+
     # ---------------- graph ----------------
     def _build(self):
         g = StateGraph(ResearchState)
@@ -267,6 +344,9 @@ class DiscoveryWorkflow:
         g.add_node("stats", self._validate_stats)
         g.add_node("critique", self._critique)
         g.add_node("remember", self._remember)
+        g.add_node("collect", self._collect_context)
+        g.add_node("synthesize", self._synthesize)
+        g.add_node("latex", self._generate_latex)
 
         g.set_entry_point("ingest")
         g.add_edge("ingest", "review")
@@ -277,7 +357,10 @@ class DiscoveryWorkflow:
         g.add_edge("figures", "stats")
         g.add_edge("stats", "critique")
         g.add_edge("critique", "remember")
-        g.add_edge("remember", END)
+        g.add_edge("remember", "collect")
+        g.add_edge("collect", "synthesize")
+        g.add_edge("synthesize", "latex")
+        g.add_edge("latex", END)
         return g.compile()
 
     def run(self, topic: str) -> ResearchState:
