@@ -1,0 +1,113 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{natbib}
+
+\title{<< title | latex >>}
+\author{Autonomous Multimodal Scientific Discovery Agent \\ \textit{AI-assisted research draft}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+<< abstract | latex >>
+\end{abstract}
+
+\section{Introduction}
+<< introduction | latex >>
+
+\section{Related Work}
+<< related_work | latex >>
+
+\section{Methodology}
+<< methodology | latex >>
+
+\subsection*{Research Hypothesis}
+<< hypothesis | latex >>
+
+\section{Experimental Setup}
+<< experimental_setup | latex >>
+
+\begin{table}[H]
+\centering
+\caption{Experiment plan summary.}
+\begin{tabular}{ll}
+\toprule
+Field & Value \\
+\midrule
+Task type & << plan.get('task_type', 'n/a') | latex >> \\
+Baseline model & << plan.get('baseline_model', 'n/a') | latex >> \\
+Proposed model & << plan.get('proposed_model', 'n/a') | latex >> \\
+Dataset & << plan.get('dataset', {}).get('name', 'n/a') | latex >> \\
+Metrics & << plan.get('evaluation_metrics', []) | join(', ') | latex >> \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Results}
+<< results | latex >>
+
+\begin{table}[H]
+\centering
+\caption{Model performance metrics.}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+<% for m in metrics %>
+<< m.metric | latex >> & << m.value | latex >> \\
+<% endfor %>
+\bottomrule
+\end{tabular}
+\end{table}
+
+<% for f in figures %>
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{<< fig_dir >>/<< f.path >>}
+\caption{<< f.caption | latex >> (Chart type: << f.chart_type | latex >>)}
+\label{<< f.label >>}
+\end{figure}
+<% endfor %>
+
+\section{Statistical Analysis}
+<< statistical_analysis | latex >>
+
+<% if stats and stats.get('comparison') %>
+\begin{itemize}
+\item Test: << stats.comparison.get('test', 'n/a') | latex >>
+\item p-value: << stats.comparison.get('p_value', 'n/a') | latex >>
+\item Significant at 0.05: << stats.comparison.get('significant', False) | latex >>
+\end{itemize}
+<% endif %>
+
+\section{Discussion}
+<< discussion | latex >>
+
+\subsection*{Critic Agent Verdict}
+\textbf{Verdict:} << critique.get('verdict', 'inconclusive') | latex >> \\
+\textbf{Severity:} << critique.get('severity', 'unknown') | latex >>
+
+<% if critique.get('concerns') %>
+\textbf{Concerns:}
+\begin{itemize}
+<% for c in critique.get('concerns', []) %>
+\item \textit{<< c.get('issue', '') | latex >>} — << c.get('suggestion', '') | latex >>
+<% endfor %>
+\end{itemize}
+<% endif %>
+
+\section{Conclusion}
+<< conclusion | latex >>
+
+\bibliographystyle{plainnat}
+\bibliography{<< experiment_id >>}
+
+\end{document}
