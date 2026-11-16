@@ -1,3 +1,6 @@
+# ==========================================
+# WEEK 1: Foundation & Literature Retrieval
+# ==========================================
 langchain==0.2.16
 langchain-community==0.2.16
 langchain-openai==0.1.23
@@ -11,18 +14,31 @@ requests==2.32.3
 python-dotenv==1.0.1
 tqdm==4.66.5
 pydantic==2.8.2
+
+# ==========================================
+# WEEK 2: Experimentation & Docker Sandbox
+# ==========================================
 docker==7.1.0
 pandas==2.2.2
 numpy==1.26.4
 scikit-learn==1.5.1
 scipy==1.14.0
+openai>=1.0.0            # Required for LangChain and VLM API calls
 
-# existing...
-# Week 3 additions
+# ==========================================
+# WEEK 3: Multimodal & Statistical Validation
+# ==========================================
 transformers==4.44.2
 torch==2.4.0
 accelerate==0.33.0
 pillow==10.4.0
 statsmodels==0.14.2
-scipy==1.14.0           # already present in Week 2, keep
 pdfplumber==0.11.4
+
+# ==========================================
+# WEEK 4: Synthesis, Dashboard & Evaluation
+# ==========================================
+streamlit==1.38.0
+jinja2==3.1.4
+matplotlib==3.9.2
+plotly==5.24.0
