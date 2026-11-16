@@ -6,7 +6,6 @@ from scipy import stats
 class StatisticalValidator:
     """Confidence intervals, paired tests, and multiple-comparison correction."""
 
-    # ---------- confidence intervals ----------
     def bootstrap_ci(self, scores: List[float], confidence: float = 0.95,
                      n_boot: int = 2000, seed: int = 42) -> Dict[str, float]:
         if not scores:
@@ -26,18 +25,8 @@ class StatisticalValidator:
             "n": int(arr.size),
         }
 
-    # ---------- paired comparison ----------
     def paired_test(self, baseline: List[float], proposed: List[float],
                     design_hint: Optional[str] = None) -> Dict[str, Any]:
-        """Pick a test based on design hint; default = paired t-test.
-
-        design_hint:
-            "paired_normal"     -> paired t-test
-            "paired_nonnormal"  -> Wilcoxon signed-rank
-            "unpaired"          -> Welch's t-test
-            "cv_folds"          -> paired t-test on fold scores (correct for CV)
-            None                -> auto: Shapiro-Wilk on diffs
-        """
         b = np.asarray(baseline, dtype=float)
         p = np.asarray(proposed, dtype=float)
         if b.size == 0 or p.size == 0:
@@ -99,7 +88,6 @@ class StatisticalValidator:
             "n_proposed": int(p.size),
         }
 
-    # ---------- convenience: full report ----------
     def report(self, baseline: List[float], proposed: List[float],
                design_hint: Optional[str] = None) -> Dict[str, Any]:
         return {
